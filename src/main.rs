@@ -1,10 +1,9 @@
 mod calculator;
 
 use calculator::Calculator;
-use clap::{Parser, ValueEnum};
-use rmcp::transport::{
-    sse_server::SseServer,
-    streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager},
+use clap::Parser;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tracing_subscriber::{self, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,15 +15,6 @@ struct Args {
     /// Socket address to bind to
     #[arg(short, long, default_value = DEFAULT_SOCKET_ADDR)]
     socket_addr: String,
-    /// Transport type to use (sse or stream-http)
-    #[arg(short, long, value_enum, default_value = "stream-http")]
-    transport: TransportType,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum TransportType {
-    Sse,
-    StreamHttp,
 }
 
 #[tokio::main]
@@ -44,29 +34,25 @@ async fn main() -> anyhow::Result<()> {
         args.socket_addr
     );
 
-    match args.transport {
-        TransportType::StreamHttp => {
-            let service = StreamableHttpService::new(
-                || Ok(Calculator::new()),
-                LocalSessionManager::default().into(),
-                Default::default(),
-            );
+    let ct = tokio_util::sync::CancellationToken::new();
 
-            let router = axum::Router::new().nest_service("/mcp", service);
-            let tcp_listener = tokio::net::TcpListener::bind(args.socket_addr).await?;
-            let _ = axum::serve(tcp_listener, router)
-                .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
-                .await;
-        }
-        TransportType::Sse => {
-            let ct = SseServer::serve(args.socket_addr.parse()?)
-                .await?
-                .with_service(Calculator::new);
+    let service = StreamableHttpService::new(
+        || Ok(Calculator::new()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig {
+            cancellation_token: ct.clone(),
+            ..Default::default()
+        },
+    );
 
-            tokio::signal::ctrl_c().await?;
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind(args.socket_addr).await?;
+    let _ = axum::serve(tcp_listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.unwrap();
             ct.cancel();
-        }
-    }
+        })
+        .await;
 
     Ok(())
 }
